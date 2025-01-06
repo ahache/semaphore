@@ -1,3 +1,7 @@
+/* eslint-disable no-console */
+/* eslint-disable no-plusplus */
+/* eslint-disable arrow-body-style */
+
 /* eslint-disable @typescript-eslint/no-shadow */
 /* eslint-disable jest/valid-expect */
 import { Group, Identity, SemaphoreProof, generateProof } from "@semaphore-protocol/core"
@@ -574,6 +578,163 @@ describe("Semaphore", () => {
                 semaphoreContract,
                 "Semaphore__YouAreUsingTheSameNullifierTwice"
             )
+        })
+
+        /**
+         * This demonstrates a critical issue with member updates and tree roots:
+         * When working with a group whose size is not a power of 2, updating a member and then
+         * adding new members can cause the Merkle roots to diverge between an in-memory tree
+         * and the on-chain tree, effectively freezing out updates, removals and member generated
+         * inclusion proofs since a valid merkle proof cannot be generated.
+         *
+         * This is triggered by the sideNodes array not being updated in the _update function
+         * so an incorrect value is used when computing parent nodes.
+         *
+         * This test will only pass once the InternalLeanIMT.sol _update logic is fixed.
+         *
+         * yarn test test/Semaphore.ts --grep "Should insert members, update member, insert more members and verify merkle roots"
+         */
+        it("Should insert members, update member, insert more members and verify merkle roots", async () => {
+            const { semaphoreContract, accountAddresses } = await loadFixture(deployValidateProofFixture)
+
+            // Create initial members
+            // Using a value 2^n will pass the test, all other group sizes will fail
+            const memberCount = 77
+            const members = Array.from({ length: memberCount }, (_, i) => new Identity(i.toString())).map(
+                ({ commitment }) => commitment
+            )
+            const group = new Group()
+
+            // Create group
+            await semaphoreContract["createGroup(address)"](accountAddresses[0])
+            const groupId = 2
+
+            // Add members one by one
+            for (const member of members) {
+                await semaphoreContract.addMember(groupId, member)
+                group.addMember(member)
+            }
+
+            // Verify roots match after adding initial members
+            const contractRoot1 = await semaphoreContract.getMerkleTreeRoot(groupId)
+            // This will always pass
+            expect(contractRoot1).to.equal(group.root)
+
+            // Create new identity and get siblings for index 1 update
+            const identityIndex = 28
+            const newIdentity = new Identity("new")
+            const { siblings } = group.generateMerkleProof(identityIndex)
+
+            // Update member in both groups
+            group.updateMember(identityIndex, newIdentity.commitment)
+            await semaphoreContract.updateMember(groupId, members[identityIndex], newIdentity.commitment, siblings)
+
+            // Verify roots match after update
+            const contractRoot2 = await semaphoreContract.getMerkleTreeRoot(groupId)
+            // This will always pass
+            expect(contractRoot2).to.equal(group.root)
+
+            // Add one more member to both groups
+            const finalIdentity = new Identity("final")
+            group.addMember(finalIdentity.commitment)
+            await semaphoreContract.addMember(groupId, finalIdentity.commitment)
+
+            // Verify roots match after final addition
+            const contractRoot3 = await semaphoreContract.getMerkleTreeRoot(groupId)
+            // This is the assertion that will fail with a non 2^n group size
+            expect(contractRoot3).to.equal(group.root)
+        })
+
+        /**
+         * Tests Semaphore group operations with random group sizes and mixed operations.
+         * Creates a group with random number of members (3-100), adds them using both
+         * single and batch insertions, then performs random updates. Verifies merkle
+         * roots match between contract and local group after each operation. Finally,
+         * adds a random batch of members and verifies the roots match.
+         *
+         * This test will only pass once the InternalLeanIMT.sol _update logic is fixed.
+         *
+         * yarn test test/Semaphore.ts --grep "Should handle random group sizes with multiple random updates and insertions"
+         */
+        it("Should handle random group sizes with multiple random updates and insertions", async () => {
+            const { semaphoreContract, accountAddresses } = await loadFixture(deploySemaphoreFixture)
+
+            // Create initial members (random size between 3 and 100)
+            const memberCount = Math.floor(Math.random() * 98) + 3
+            const members = Array.from({ length: memberCount }, (_, i) => new Identity(i.toString())).map(
+                ({ commitment }) => commitment
+            )
+            const group = new Group()
+
+            // Create group and get groupId from counter
+            const tx = await semaphoreContract["createGroup(address)"](accountAddresses[0])
+            await tx.wait()
+            const groupId = (await semaphoreContract.groupCounter()) - 1n // Note: using BigInt subtraction
+
+            // Add initial members (randomly choosing between single and batch insertion)
+            let currentIndex = 0
+            while (currentIndex < members.length) {
+                const shouldBatch = Math.random() > 0.5
+                if (shouldBatch) {
+                    const batchSize = Math.min(Math.floor(Math.random() * 10) + 1, members.length - currentIndex)
+                    const batch = members.slice(currentIndex, currentIndex + batchSize)
+                    await semaphoreContract.addMembers(groupId, batch)
+                    batch.forEach((member) => group.addMember(member))
+                    currentIndex += batchSize
+                } else {
+                    await semaphoreContract.addMember(groupId, members[currentIndex])
+                    group.addMember(members[currentIndex])
+                    currentIndex++
+                }
+            }
+
+            // Verify roots match after initial insertions
+            const contractRoot1 = await semaphoreContract.getMerkleTreeRoot(groupId)
+            expect(contractRoot1).to.equal(group.root)
+
+            // Perform random number of updates (between 1 and 20)
+            const updateCount = Math.floor(Math.random() * 20) + 1
+            for (let i = 0; i < updateCount; i++) {
+                const updateIndex = Math.floor(Math.random() * members.length)
+                const newIdentity = new Identity(`new-${i}`)
+                const { siblings } = group.generateMerkleProof(updateIndex)
+
+                // Update member in both groups
+                group.updateMember(updateIndex, newIdentity.commitment)
+                await semaphoreContract.updateMember(groupId, members[updateIndex], newIdentity.commitment, siblings)
+                members[updateIndex] = newIdentity.commitment
+
+                // Verify roots match after each update
+                const contractRoot = await semaphoreContract.getMerkleTreeRoot(groupId)
+                expect(contractRoot).to.equal(group.root)
+            }
+
+            // Add final random batch of members (between 1 and 10)
+            const finalMemberCount = Math.floor(Math.random() * 10) + 1
+            const finalMembers = Array.from({ length: finalMemberCount }, (_, i) => {
+                return new Identity(`final-${i}`).commitment
+            })
+
+            // Randomly choose between single and batch insertion for final members
+            currentIndex = 0
+            while (currentIndex < finalMembers.length) {
+                const shouldBatch = Math.random() > 0.5
+                if (shouldBatch) {
+                    const batchSize = Math.min(Math.floor(Math.random() * 5) + 1, finalMembers.length - currentIndex)
+                    const batch = finalMembers.slice(currentIndex, currentIndex + batchSize)
+                    await semaphoreContract.addMembers(groupId, batch)
+                    batch.forEach((member) => group.addMember(member))
+                    currentIndex += batchSize
+                } else {
+                    await semaphoreContract.addMember(groupId, finalMembers[currentIndex])
+                    group.addMember(finalMembers[currentIndex])
+                    currentIndex++
+                }
+            }
+
+            // Verify final roots match
+            const contractRoot3 = await semaphoreContract.getMerkleTreeRoot(groupId)
+            expect(contractRoot3).to.equal(group.root)
         })
     })
 
